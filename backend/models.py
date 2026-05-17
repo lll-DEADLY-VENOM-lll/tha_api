@@ -5,7 +5,7 @@ validates Claude's output against `SummaryPayload` before returning it,
 so the frontend can rely on a stable contract.
 """
 from typing import List, Optional
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class VideoMetadata(BaseModel):
@@ -34,12 +34,12 @@ class SummaryContent(BaseModel):
 
 
 class ResponseMetadata(BaseModel):
-    """Diagnostics — useful for debugging and the case study cost-math.
+    """Diagnostics — useful for debugging and cost tracking.
 
-    The token breakdown lets the UI distinguish "cache HIT (savings!)" from
-    "cache MISS, first call (next will be cheaper)" from "too short to cache
-    (transcript under Anthropic's 1024-token minimum)" — all three are
-    information the user benefits from seeing.
+    Token breakdown lets the UI distinguish:
+      - cache HIT  (savings!)
+      - cache MISS, first call (next will be cheaper)
+      - too short to cache (transcript under Anthropic's 1024-token minimum)
     """
     generated_at: str
     model: str

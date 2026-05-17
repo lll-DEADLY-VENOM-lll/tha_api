@@ -11,7 +11,7 @@ SummaryPayload (see models.py).
 External dependencies:
   - yt_dlp (Python lib)             https://github.com/yt-dlp/yt-dlp
   - whisper.cpp CLI                 /opt/homebrew/bin/whisper
-  - ffmpeg (used by yt-dlp)         /opt/homebrew/bin/ffmpeg
+  - ffmpeg (used by yt-dlp)         auto-detected via PATH
   - anthropic SDK                   https://github.com/anthropics/anthropic-sdk-python
 """
 from __future__ import annotations
@@ -42,7 +42,17 @@ logger = logging.getLogger(__name__)
 
 # ---------- configuration ----------
 
-WHISPER_BIN = os.getenv("WHISPER_BIN", "/opt/homebrew/bin/whisper")
+# whisper binary: check PATH first, then fallback to common locations
+def _find_whisper_bin() -> str:
+    env_val = os.getenv("WHISPER_BIN", "")
+    if env_val:
+        return env_val
+    for candidate in ["whisper", "/opt/homebrew/bin/whisper", "/usr/local/bin/whisper"]:
+        if shutil.which(candidate) or Path(candidate).exists():
+            return candidate
+    return "whisper"  # will fail loudly at transcribe time
+
+WHISPER_BIN = _find_whisper_bin()
 WHISPER_MODEL = os.getenv(
     "WHISPER_MODEL",
     str(Path.home() / ".cache/hyperframes/whisper/models/ggml-small.en.bin"),
@@ -106,14 +116,22 @@ def download_audio(url: str, out_dir: Path) -> Tuple[Path, dict]:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        # YouTube increasingly 403s the default 'web' player_client.
-        # Try multiple clients in order — 'ios' and 'android' use mobile-app
-        # tokens that bypass most web-tier blocks.
+        # Try multiple player clients — iOS/Android bypass most web-tier 403s
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android", "web"],
             }
         },
+        # Add a browser-like User-Agent to reduce bot detection
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+        },
+        # Retry on transient network failures
+        "retries": 3,
+        "fragment_retries": 3,
     }
 
     logger.info("yt-dlp: downloading audio from %s", url)
@@ -122,7 +140,14 @@ def download_audio(url: str, out_dir: Path) -> Tuple[Path, dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
+        err_str = str(e).lower()
         logger.error("yt-dlp DownloadError: %s", e)
+        if "private" in err_str:
+            raise DownloadError("This video is private and cannot be accessed.") from e
+        if "age" in err_str:
+            raise DownloadError("This video is age-restricted and cannot be downloaded.") from e
+        if "unavailable" in err_str or "not available" in err_str:
+            raise DownloadError("This video is unavailable in your region or has been removed.") from e
         raise DownloadError(f"Couldn't download this video: {e}") from e
     except Exception as e:
         logger.exception("yt-dlp unexpected error")
@@ -157,26 +182,29 @@ def transcribe(audio_path: Path) -> dict:
     audio_path = Path(audio_path)
     if not audio_path.exists():
         raise TranscribeError(f"Audio file not found: {audio_path}")
-    if not Path(WHISPER_MODEL).exists():
+
+    whisper_model = Path(WHISPER_MODEL)
+    if not whisper_model.exists():
         raise TranscribeError(
             f"Whisper model not found at {WHISPER_MODEL}. "
             f"Set WHISPER_MODEL env var or install ggml-small.en.bin."
         )
     if not shutil.which(WHISPER_BIN) and not Path(WHISPER_BIN).exists():
-        raise TranscribeError(f"Whisper binary not found at {WHISPER_BIN}.")
+        raise TranscribeError(
+            f"Whisper binary not found at '{WHISPER_BIN}'. "
+            f"Install whisper.cpp or set WHISPER_BIN env var."
+        )
 
-    logger.info("whisper: transcribing %s", audio_path.name)
+    logger.info("whisper: transcribing %s (%.1f MB)", audio_path.name,
+                audio_path.stat().st_size / 1_048_576)
     t0 = time.time()
-    # -oj  output JSON next to the audio file (audio.wav.json)
-    # -nt  no timestamps in the text output (we don't need them for summarization)
-    # -l en force English (matches small.en model)
     cmd = [
         WHISPER_BIN,
-        "-m", WHISPER_MODEL,
+        "-m", str(whisper_model),
         "-f", str(audio_path),
-        "-oj",
-        "-l", "en",
-        "-nt",
+        "-oj",       # output JSON beside the audio file
+        "-l", "en",  # force English
+        "-nt",       # no timestamps in text
     ]
     try:
         proc = subprocess.run(
@@ -186,7 +214,7 @@ def transcribe(audio_path: Path) -> dict:
         raise TranscribeError("Whisper transcription timed out after 10 minutes.") from e
     if proc.returncode != 0:
         logger.error("whisper stderr: %s", proc.stderr[-500:])
-        raise TranscribeError(f"Whisper failed: {proc.stderr[-200:]}")
+        raise TranscribeError(f"Whisper failed (exit {proc.returncode}): {proc.stderr[-200:]}")
 
     elapsed = time.time() - t0
     logger.info("whisper: completed in %.1fs", elapsed)
@@ -194,7 +222,6 @@ def transcribe(audio_path: Path) -> dict:
     # whisper.cpp writes <audio>.json beside the input file
     json_path = audio_path.with_suffix(audio_path.suffix + ".json")
     if not json_path.exists():
-        # Some versions write to <audio_basename>.json (without compound suffix)
         json_path = audio_path.parent / (audio_path.stem + ".json")
     if not json_path.exists():
         raise TranscribeError(f"Whisper finished but no JSON output found near {audio_path}.")
@@ -203,7 +230,10 @@ def transcribe(audio_path: Path) -> dict:
     # whisper.cpp output: {"transcription": [{"text": "...", "offsets": {...}}, ...]}
     segments = data.get("transcription") or data.get("segments") or []
     full_text = " ".join(s.get("text", "").strip() for s in segments).strip()
-    full_text = re.sub(r"\s+", " ", full_text)  # normalize whitespace
+    full_text = re.sub(r"\s+", " ", full_text)
+
+    if not full_text:
+        raise TranscribeError("Whisper returned an empty transcript — video may be silent.")
 
     return {
         "full_text": full_text,
@@ -218,16 +248,15 @@ class SummarizeError(Exception):
     """Raised when Claude returns an unusable response."""
 
 
-def summarize(transcript_text: str, video_title: str, client: anthropic.Anthropic) -> Tuple[SummaryContent, dict]:
+def summarize(
+    transcript_text: str,
+    video_title: str,
+    client: anthropic.Anthropic,
+) -> Tuple[SummaryContent, dict]:
     """Send transcript to Claude with prompt caching, return parsed summary + usage.
 
     The transcript content block is marked with cache_control: ephemeral so a
     second call (same transcript, different instructions) is ~90% cheaper.
-
-    Returns (SummaryContent, usage_dict) where usage_dict has:
-      - tokens_used:  total tokens accounted for in this call
-      - cache_hit:    True if any cache_read_input_tokens > 0
-      - input_tokens, cache_creation_tokens, cache_read_tokens, output_tokens
     """
     if not transcript_text or not transcript_text.strip():
         raise SummarizeError("Transcript is empty — nothing to summarize.")
@@ -280,7 +309,7 @@ def summarize(transcript_text: str, video_title: str, client: anthropic.Anthropi
         raise SummarizeError("Empty response from Claude.")
 
     raw = response.content[0].text.strip()
-    # Claude sometimes wraps JSON in prose despite instructions — extract it.
+    # Claude sometimes wraps JSON in prose — extract just the JSON object
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         logger.error("Claude response had no JSON. raw[:300]=%s", raw[:300])
@@ -303,19 +332,19 @@ def summarize(transcript_text: str, video_title: str, client: anthropic.Anthropi
         raise SummarizeError(f"AI response missing required fields: {e}") from e
 
     usage = getattr(response, "usage", None)
-    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_read   = getattr(usage, "cache_read_input_tokens",   0) or 0
     cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    input_tok = getattr(usage, "input_tokens", 0) or 0
-    output_tok = getattr(usage, "output_tokens", 0) or 0
+    input_tok    = getattr(usage, "input_tokens",  0) or 0
+    output_tok   = getattr(usage, "output_tokens", 0) or 0
     total = input_tok + cache_create + cache_read + output_tok
 
     return summary, {
-        "tokens_used": total,
-        "cache_hit": cache_read > 0,
-        "input_tokens": input_tok,
-        "cache_creation_tokens": cache_create,
-        "cache_read_tokens": cache_read,
-        "output_tokens": output_tok,
+        "tokens_used":            total,
+        "cache_hit":              cache_read > 0,
+        "input_tokens":           input_tok,
+        "cache_creation_tokens":  cache_create,
+        "cache_read_tokens":      cache_read,
+        "output_tokens":          output_tok,
     }
 
 
@@ -333,8 +362,6 @@ def run_pipeline(url: str, out_dir: Path, client: anthropic.Anthropic) -> dict:
 
     # 2. Transcribe
     transcript = transcribe(wav_path)
-    if not transcript["full_text"]:
-        raise TranscribeError("Whisper returned an empty transcript.")
 
     # 3. Summarize
     title = info.get("title") or "Untitled video"
@@ -342,7 +369,6 @@ def run_pipeline(url: str, out_dir: Path, client: anthropic.Anthropic) -> dict:
 
     pipeline_seconds = time.time() - pipeline_start
 
-    # Assemble the response payload (Pydantic-validated)
     payload = SummaryPayload(
         video=VideoMetadata(
             title=title,
